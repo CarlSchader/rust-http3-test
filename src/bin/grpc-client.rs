@@ -1,10 +1,11 @@
 // src/bin/grpc-client.rs
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use http::Uri;
 use hyper_util::rt::TokioIo;
+use indicatif::{ProgressBar, ProgressStyle};
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -24,6 +25,47 @@ const LARGE_SIZE: usize = 1_048_576; // 1 MB
 const STREAM_CHUNKS: usize = 100;
 const STREAM_CHUNK_SIZE: usize = 10_240; // 10 KB
 const MANY_COUNT: usize = 1000;
+const BIDI_CHUNKS: usize = 50;
+
+struct TestResult {
+    name: String,
+    latency: Duration,
+    throughput_mbs: Option<f64>,
+    details: String,
+}
+
+fn make_pb(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template("  [{bar:40}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb
+}
+
+fn print_summary(title: &str, results: &[TestResult]) {
+    println!("\n{}", "=".repeat(72));
+    println!("{}", title);
+    println!("{}", "=".repeat(72));
+    println!(
+        "{:<30} {:>10} {:>14}   {}",
+        "Test", "Latency", "Throughput", "Details"
+    );
+    println!("{}", "-".repeat(72));
+    for r in results {
+        let latency = format!("{:.2}ms", r.latency.as_secs_f64() * 1000.0);
+        let throughput = match r.throughput_mbs {
+            Some(t) => format!("{:.1} MB/s", t),
+            None => "-".to_string(),
+        };
+        println!(
+            "{:<30} {:>10} {:>14}   {}",
+            r.name, latency, throughput, r.details,
+        );
+    }
+    println!("{}", "=".repeat(72));
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "grpc-client", about = "gRPC benchmark client")]
@@ -82,30 +124,34 @@ async fn main() -> anyhow::Result<()> {
 
     println!("=== gRPC Benchmark ===\n");
 
-    // 1. Small payload
-    test_small_payload(&mut client).await?;
+    let mut results = Vec::new();
 
-    // 2. Large payload
-    test_large_payload(&mut client).await?;
+    println!("[1/6] Small payload...");
+    results.push(test_small_payload(&mut client).await?);
 
-    // 3. Server streaming
-    test_server_stream(&mut client).await?;
+    println!("[2/6] Large payload...");
+    results.push(test_large_payload(&mut client).await?);
 
-    // 4. Client streaming
-    test_client_stream(&mut client).await?;
+    println!("[3/6] Server streaming...");
+    results.push(test_server_stream(&mut client).await?);
 
-    // 5. Bidirectional streaming
-    test_bidi_stream(&mut client).await?;
+    println!("[4/6] Client streaming...");
+    results.push(test_client_stream(&mut client).await?);
 
-    // 6. Many small requests
-    test_many_requests(&mut client).await?;
+    println!("[5/6] Bidirectional streaming...");
+    results.push(test_bidi_stream(&mut client).await?);
+
+    println!("[6/6] Many small requests...");
+    results.push(test_many_requests(&mut client).await?);
+
+    print_summary("gRPC Benchmark Results", &results);
 
     Ok(())
 }
 
 async fn test_small_payload(
     client: &mut BenchClient<tonic::transport::Channel>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
     let data = vec![0x42u8; SMALL_SIZE];
     let start = Instant::now();
 
@@ -113,42 +159,51 @@ async fn test_small_payload(
         .small_payload(Payload { data: data.clone() })
         .await?;
 
-    let elapsed = start.elapsed();
+    let latency = start.elapsed();
     let resp_size = resp.into_inner().data.len();
+    let details = format!("sent {} B, recv {} B", SMALL_SIZE, resp_size);
     println!(
-        "Small payload ({} B):    {:.2}ms  (sent {} B, recv {} B)",
-        SMALL_SIZE,
-        elapsed.as_secs_f64() * 1000.0,
-        SMALL_SIZE,
-        resp_size,
+        "  {:.2}ms  ({})",
+        latency.as_secs_f64() * 1000.0,
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Small payload ({} B)", SMALL_SIZE),
+        latency,
+        throughput_mbs: None,
+        details,
+    })
 }
 
 async fn test_large_payload(
     client: &mut BenchClient<tonic::transport::Channel>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
     let data = vec![0x42u8; LARGE_SIZE];
     let start = Instant::now();
 
     let resp = client.large_payload(Payload { data }).await?;
 
-    let elapsed = start.elapsed();
+    let latency = start.elapsed();
     let resp_size = resp.into_inner().data.len();
     let total_bytes = (LARGE_SIZE + resp_size) as f64;
-    let throughput = total_bytes / elapsed.as_secs_f64() / 1_048_576.0;
+    let throughput = total_bytes / latency.as_secs_f64() / 1_048_576.0;
     println!(
-        "Large payload ({:.0} KB):  {:.2}ms  ({:.1} MB/s)",
-        LARGE_SIZE as f64 / 1024.0,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s)",
+        latency.as_secs_f64() * 1000.0,
         throughput,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Large payload ({:.0} KB)", LARGE_SIZE as f64 / 1024.0),
+        latency,
+        throughput_mbs: Some(throughput),
+        details: String::new(),
+    })
 }
 
 async fn test_server_stream(
     client: &mut BenchClient<tonic::transport::Channel>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb(STREAM_CHUNKS as u64);
     let start = Instant::now();
 
     let mut stream = client
@@ -165,63 +220,79 @@ async fn test_server_stream(
         let payload = payload?;
         total_bytes += payload.data.len();
         count += 1;
+        pb.set_position(count as u64);
     }
 
-    let elapsed = start.elapsed();
-    let throughput = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
+    let throughput = total_bytes as f64 / latency.as_secs_f64() / 1_048_576.0;
+    let details = format!("{} chunks, {} B", count, total_bytes);
     println!(
-        "Server stream ({} x {} KB): {:.2}ms  ({:.1} MB/s, {} chunks, {} B total)",
-        STREAM_CHUNKS,
-        STREAM_CHUNK_SIZE / 1024,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s, {})",
+        latency.as_secs_f64() * 1000.0,
         throughput,
-        count,
-        total_bytes,
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Server stream ({}x{} KB)", STREAM_CHUNKS, STREAM_CHUNK_SIZE / 1024),
+        latency,
+        throughput_mbs: Some(throughput),
+        details,
+    })
 }
 
 async fn test_client_stream(
     client: &mut BenchClient<tonic::transport::Channel>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb(STREAM_CHUNKS as u64);
     let start = Instant::now();
 
     let chunk_data = vec![0x42u8; STREAM_CHUNK_SIZE];
-    let stream = tokio_stream::iter((0..STREAM_CHUNKS).map(move |_| Payload {
-        data: chunk_data.clone(),
+    let pb_clone = pb.clone();
+    let stream = tokio_stream::iter((0..STREAM_CHUNKS).map(move |i| {
+        pb_clone.set_position((i + 1) as u64);
+        Payload {
+            data: chunk_data.clone(),
+        }
     }));
 
     let resp = client.client_stream(stream).await?;
     let resp = resp.into_inner();
 
-    let elapsed = start.elapsed();
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
     let total_bytes = STREAM_CHUNKS * STREAM_CHUNK_SIZE;
-    let throughput = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    let throughput = total_bytes as f64 / latency.as_secs_f64() / 1_048_576.0;
+    let details = format!("server got {} chunks, {} B", resp.total_chunks, resp.total_bytes);
     println!(
-        "Client stream ({} x {} KB): {:.2}ms  ({:.1} MB/s, server got {} chunks, {} B)",
-        STREAM_CHUNKS,
-        STREAM_CHUNK_SIZE / 1024,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s, {})",
+        latency.as_secs_f64() * 1000.0,
         throughput,
-        resp.total_chunks,
-        resp.total_bytes,
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Client stream ({}x{} KB)", STREAM_CHUNKS, STREAM_CHUNK_SIZE / 1024),
+        latency,
+        throughput_mbs: Some(throughput),
+        details,
+    })
 }
 
 async fn test_bidi_stream(
     client: &mut BenchClient<tonic::transport::Channel>,
-) -> anyhow::Result<()> {
-    let bidi_chunks = 50;
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb((BIDI_CHUNKS * 2) as u64);
     let start = Instant::now();
 
     let chunk_data = vec![0x42u8; STREAM_CHUNK_SIZE];
     let (tx, rx) = tokio::sync::mpsc::channel(32);
 
-    // Sender task
     let send_data = chunk_data.clone();
+    let pb_send = pb.clone();
     let send_handle = tokio::spawn(async move {
-        for _ in 0..bidi_chunks {
+        for _ in 0..BIDI_CHUNKS {
             if tx
                 .send(Payload {
                     data: send_data.clone(),
@@ -231,6 +302,7 @@ async fn test_bidi_stream(
             {
                 break;
             }
+            pb_send.inc(1);
         }
     });
 
@@ -243,27 +315,35 @@ async fn test_bidi_stream(
         let payload = payload?;
         recv_bytes += payload.data.len();
         recv_count += 1;
+        pb.inc(1);
     }
 
     send_handle.await?;
 
-    let elapsed = start.elapsed();
-    let total_bytes = (bidi_chunks * STREAM_CHUNK_SIZE + recv_bytes) as f64;
-    let throughput = total_bytes / elapsed.as_secs_f64() / 1_048_576.0;
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
+    let total_bytes = (BIDI_CHUNKS * STREAM_CHUNK_SIZE + recv_bytes) as f64;
+    let throughput = total_bytes / latency.as_secs_f64() / 1_048_576.0;
+    let details = format!("sent {}, recv {} chunks", BIDI_CHUNKS, recv_count);
     println!(
-        "Bidi stream ({} each way): {:.2}ms  ({:.1} MB/s, sent {}, recv {} chunks)",
-        bidi_chunks,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s, {})",
+        latency.as_secs_f64() * 1000.0,
         throughput,
-        bidi_chunks,
-        recv_count,
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Bidi stream ({} each way)", BIDI_CHUNKS),
+        latency,
+        throughput_mbs: Some(throughput),
+        details,
+    })
 }
 
 async fn test_many_requests(
     client: &mut BenchClient<tonic::transport::Channel>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb(MANY_COUNT as u64);
     let data = vec![0x42u8; SMALL_SIZE];
     let start = Instant::now();
 
@@ -271,17 +351,25 @@ async fn test_many_requests(
         client
             .small_payload(Payload { data: data.clone() })
             .await?;
+        pb.inc(1);
     }
 
-    let elapsed = start.elapsed();
-    let rps = MANY_COUNT as f64 / elapsed.as_secs_f64();
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
+    let rps = MANY_COUNT as f64 / latency.as_secs_f64();
+    let details = format!("{:.0} req/s", rps);
     println!(
-        "Many requests ({} reqs):  {:.2}ms  ({:.0} req/s)",
-        MANY_COUNT,
-        elapsed.as_secs_f64() * 1000.0,
-        rps,
+        "  {:.2}ms  ({})",
+        latency.as_secs_f64() * 1000.0,
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Many requests ({})", MANY_COUNT),
+        latency,
+        throughput_mbs: None,
+        details,
+    })
 }
 
 #[derive(Debug)]

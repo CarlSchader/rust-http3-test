@@ -1,7 +1,7 @@
 // src/bin/http2-client.rs
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::Parser;
@@ -10,6 +10,7 @@ use hyper::body::Frame;
 use hyper::client::conn::http2;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use indicatif::{ProgressBar, ProgressStyle};
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -33,6 +34,47 @@ const LARGE_SIZE: usize = 1_048_576; // 1 MB
 const STREAM_CHUNKS: usize = 100;
 const STREAM_CHUNK_SIZE: usize = 10_240; // 10 KB
 const MANY_COUNT: usize = 1000;
+const BIDI_CHUNKS: usize = 50;
+
+struct TestResult {
+    name: String,
+    latency: Duration,
+    throughput_mbs: Option<f64>,
+    details: String,
+}
+
+fn make_pb(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template("  [{bar:40}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb
+}
+
+fn print_summary(title: &str, results: &[TestResult]) {
+    println!("\n{}", "=".repeat(72));
+    println!("{}", title);
+    println!("{}", "=".repeat(72));
+    println!(
+        "{:<30} {:>10} {:>14}   {}",
+        "Test", "Latency", "Throughput", "Details"
+    );
+    println!("{}", "-".repeat(72));
+    for r in results {
+        let latency = format!("{:.2}ms", r.latency.as_secs_f64() * 1000.0);
+        let throughput = match r.throughput_mbs {
+            Some(t) => format!("{:.1} MB/s", t),
+            None => "-".to_string(),
+        };
+        println!(
+            "{:<30} {:>10} {:>14}   {}",
+            r.name, latency, throughput, r.details,
+        );
+    }
+    println!("{}", "=".repeat(72));
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "http2-client", about = "HTTP/2 benchmark client")]
@@ -87,23 +129,27 @@ async fn main() -> anyhow::Result<()> {
 
     println!("=== HTTP/2 Benchmark ===\n");
 
-    // 1. Small payload
-    test_small_payload(&sender, &base_uri).await?;
+    let mut results = Vec::new();
 
-    // 2. Large payload
-    test_large_payload(&sender, &base_uri).await?;
+    println!("[1/6] Small payload...");
+    results.push(test_small_payload(&sender, &base_uri).await?);
 
-    // 3. Server streaming
-    test_server_stream(&sender, &base_uri).await?;
+    println!("[2/6] Large payload...");
+    results.push(test_large_payload(&sender, &base_uri).await?);
 
-    // 4. Client streaming
-    test_client_stream(&sender, &base_uri).await?;
+    println!("[3/6] Server streaming...");
+    results.push(test_server_stream(&sender, &base_uri).await?);
 
-    // 5. Bidirectional streaming
-    test_bidi_stream(&sender, &base_uri).await?;
+    println!("[4/6] Client streaming...");
+    results.push(test_client_stream(&sender, &base_uri).await?);
 
-    // 6. Many small requests
-    test_many_requests(&sender, &base_uri).await?;
+    println!("[5/6] Bidirectional streaming...");
+    results.push(test_bidi_stream(&sender, &base_uri).await?);
+
+    println!("[6/6] Many small requests...");
+    results.push(test_many_requests(&sender, &base_uri).await?);
+
+    print_summary("HTTP/2 Benchmark Results", &results);
 
     Ok(())
 }
@@ -111,56 +157,57 @@ async fn main() -> anyhow::Result<()> {
 async fn test_small_payload(
     sender: &http2::SendRequest<BoxBody>,
     base_uri: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
     let data = Bytes::from(vec![0x42u8; SMALL_SIZE]);
     let start = Instant::now();
 
-    let req = Request::post(format!("{}/small", base_uri))
-        .body(full_body(data))?;
-
+    let req = Request::post(format!("{}/small", base_uri)).body(full_body(data))?;
     let resp = sender.clone().send_request(req).await?;
     let body = resp.into_body().collect().await?.to_bytes();
 
-    let elapsed = start.elapsed();
-    println!(
-        "Small payload ({} B):    {:.2}ms  (sent {} B, recv {} B)",
-        SMALL_SIZE,
-        elapsed.as_secs_f64() * 1000.0,
-        SMALL_SIZE,
-        body.len(),
-    );
-    Ok(())
+    let latency = start.elapsed();
+    let details = format!("sent {} B, recv {} B", SMALL_SIZE, body.len());
+    println!("  {:.2}ms  ({})", latency.as_secs_f64() * 1000.0, details);
+    Ok(TestResult {
+        name: format!("Small payload ({} B)", SMALL_SIZE),
+        latency,
+        throughput_mbs: None,
+        details,
+    })
 }
 
 async fn test_large_payload(
     sender: &http2::SendRequest<BoxBody>,
     base_uri: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
     let data = Bytes::from(vec![0x42u8; LARGE_SIZE]);
     let start = Instant::now();
 
-    let req = Request::post(format!("{}/large", base_uri))
-        .body(full_body(data))?;
-
+    let req = Request::post(format!("{}/large", base_uri)).body(full_body(data))?;
     let resp = sender.clone().send_request(req).await?;
     let body = resp.into_body().collect().await?.to_bytes();
 
-    let elapsed = start.elapsed();
+    let latency = start.elapsed();
     let total_bytes = (LARGE_SIZE + body.len()) as f64;
-    let throughput = total_bytes / elapsed.as_secs_f64() / 1_048_576.0;
+    let throughput = total_bytes / latency.as_secs_f64() / 1_048_576.0;
     println!(
-        "Large payload ({:.0} KB):  {:.2}ms  ({:.1} MB/s)",
-        LARGE_SIZE as f64 / 1024.0,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s)",
+        latency.as_secs_f64() * 1000.0,
         throughput,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Large payload ({:.0} KB)", LARGE_SIZE as f64 / 1024.0),
+        latency,
+        throughput_mbs: Some(throughput),
+        details: String::new(),
+    })
 }
 
 async fn test_server_stream(
     sender: &http2::SendRequest<BoxBody>,
     base_uri: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb(STREAM_CHUNKS as u64);
     let start = Instant::now();
 
     let params = format!("{}:{}", STREAM_CHUNKS, STREAM_CHUNK_SIZE);
@@ -177,43 +224,49 @@ async fn test_server_stream(
         if let Some(data) = frame.data_ref() {
             total_bytes += data.len();
             count += 1;
+            pb.set_position(count as u64);
         }
     }
 
-    let elapsed = start.elapsed();
-    let throughput = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
+    let throughput = total_bytes as f64 / latency.as_secs_f64() / 1_048_576.0;
+    let details = format!("{} chunks, {} B", count, total_bytes);
     println!(
-        "Server stream ({} x {} KB): {:.2}ms  ({:.1} MB/s, {} chunks, {} B total)",
-        STREAM_CHUNKS,
-        STREAM_CHUNK_SIZE / 1024,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s, {})",
+        latency.as_secs_f64() * 1000.0,
         throughput,
-        count,
-        total_bytes,
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Server stream ({}x{} KB)", STREAM_CHUNKS, STREAM_CHUNK_SIZE / 1024),
+        latency,
+        throughput_mbs: Some(throughput),
+        details,
+    })
 }
 
 async fn test_client_stream(
     sender: &http2::SendRequest<BoxBody>,
     base_uri: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb(STREAM_CHUNKS as u64);
     let start = Instant::now();
 
     let (tx, rx) = mpsc::channel::<Bytes>(32);
 
-    let req = Request::post(format!("{}/client-stream", base_uri))
-        .body(stream_body(rx))?;
-
+    let req = Request::post(format!("{}/client-stream", base_uri)).body(stream_body(rx))?;
     let resp_fut = sender.clone().send_request(req);
 
-    // Send chunks
+    let pb_clone = pb.clone();
     let send_handle = tokio::spawn(async move {
         let chunk = Bytes::from(vec![0x42u8; STREAM_CHUNK_SIZE]);
-        for _ in 0..STREAM_CHUNKS {
+        for i in 0..STREAM_CHUNKS {
             if tx.send(chunk.clone()).await.is_err() {
                 break;
             }
+            pb_clone.set_position((i + 1) as u64);
         }
     });
 
@@ -221,41 +274,46 @@ async fn test_client_stream(
     send_handle.await?;
     let body = resp.into_body().collect().await?.to_bytes();
 
-    let elapsed = start.elapsed();
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
     let total_bytes = STREAM_CHUNKS * STREAM_CHUNK_SIZE;
-    let throughput = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    let throughput = total_bytes as f64 / latency.as_secs_f64() / 1_048_576.0;
+    let details = format!("server resp: {}", String::from_utf8_lossy(&body));
     println!(
-        "Client stream ({} x {} KB): {:.2}ms  ({:.1} MB/s, server resp: {})",
-        STREAM_CHUNKS,
-        STREAM_CHUNK_SIZE / 1024,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s, {})",
+        latency.as_secs_f64() * 1000.0,
         throughput,
-        String::from_utf8_lossy(&body),
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Client stream ({}x{} KB)", STREAM_CHUNKS, STREAM_CHUNK_SIZE / 1024),
+        latency,
+        throughput_mbs: Some(throughput),
+        details,
+    })
 }
 
 async fn test_bidi_stream(
     sender: &http2::SendRequest<BoxBody>,
     base_uri: &str,
-) -> anyhow::Result<()> {
-    let bidi_chunks = 50;
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb((BIDI_CHUNKS * 2) as u64);
     let start = Instant::now();
 
     let (tx, rx) = mpsc::channel::<Bytes>(32);
 
-    let req = Request::post(format!("{}/bidi", base_uri))
-        .body(stream_body(rx))?;
-
+    let req = Request::post(format!("{}/bidi", base_uri)).body(stream_body(rx))?;
     let resp_fut = sender.clone().send_request(req);
 
-    // Sender task
+    let pb_send = pb.clone();
     let send_handle = tokio::spawn(async move {
         let chunk = Bytes::from(vec![0x42u8; STREAM_CHUNK_SIZE]);
-        for _ in 0..bidi_chunks {
+        for _ in 0..BIDI_CHUNKS {
             if tx.send(chunk.clone()).await.is_err() {
                 break;
             }
+            pb_send.inc(1);
         }
     });
 
@@ -269,29 +327,37 @@ async fn test_bidi_stream(
         if let Some(data) = frame.data_ref() {
             recv_bytes += data.len();
             recv_count += 1;
+            pb.inc(1);
         }
     }
 
     send_handle.await?;
 
-    let elapsed = start.elapsed();
-    let total_bytes = (bidi_chunks * STREAM_CHUNK_SIZE + recv_bytes) as f64;
-    let throughput = total_bytes / elapsed.as_secs_f64() / 1_048_576.0;
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
+    let total_bytes = (BIDI_CHUNKS * STREAM_CHUNK_SIZE + recv_bytes) as f64;
+    let throughput = total_bytes / latency.as_secs_f64() / 1_048_576.0;
+    let details = format!("sent {}, recv {} chunks", BIDI_CHUNKS, recv_count);
     println!(
-        "Bidi stream ({} each way): {:.2}ms  ({:.1} MB/s, sent {}, recv {} chunks)",
-        bidi_chunks,
-        elapsed.as_secs_f64() * 1000.0,
+        "  {:.2}ms  ({:.1} MB/s, {})",
+        latency.as_secs_f64() * 1000.0,
         throughput,
-        bidi_chunks,
-        recv_count,
+        details,
     );
-    Ok(())
+    Ok(TestResult {
+        name: format!("Bidi stream ({} each way)", BIDI_CHUNKS),
+        latency,
+        throughput_mbs: Some(throughput),
+        details,
+    })
 }
 
 async fn test_many_requests(
     sender: &http2::SendRequest<BoxBody>,
     base_uri: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TestResult> {
+    let pb = make_pb(MANY_COUNT as u64);
     let data = Bytes::from(vec![0x42u8; SMALL_SIZE]);
     let start = Instant::now();
 
@@ -300,17 +366,21 @@ async fn test_many_requests(
             .body(full_body(data.clone()))?;
         let resp = sender.clone().send_request(req).await?;
         resp.into_body().collect().await?;
+        pb.inc(1);
     }
 
-    let elapsed = start.elapsed();
-    let rps = MANY_COUNT as f64 / elapsed.as_secs_f64();
-    println!(
-        "Many requests ({} reqs):  {:.2}ms  ({:.0} req/s)",
-        MANY_COUNT,
-        elapsed.as_secs_f64() * 1000.0,
-        rps,
-    );
-    Ok(())
+    let latency = start.elapsed();
+    pb.finish_and_clear();
+
+    let rps = MANY_COUNT as f64 / latency.as_secs_f64();
+    let details = format!("{:.0} req/s", rps);
+    println!("  {:.2}ms  ({})", latency.as_secs_f64() * 1000.0, details);
+    Ok(TestResult {
+        name: format!("Many requests ({})", MANY_COUNT),
+        latency,
+        throughput_mbs: None,
+        details,
+    })
 }
 
 #[derive(Debug)]
