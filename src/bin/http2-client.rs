@@ -1,21 +1,28 @@
-// src/bin/client.rs
+// src/bin/http2-client.rs
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use clap::Parser;
+use http_body_util::{BodyExt, Empty};
+use hyper::client::conn::http2;
+use hyper::Request;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 #[derive(Parser, Debug)]
-#[command(name = "h3-client", about = "HTTP/3 client")]
+#[command(name = "http2-client", about = "HTTP/2 client")]
 struct Args {
     /// Host to connect to
     #[arg(short = 'H', long, default_value = "127.0.0.1")]
     host: String,
 
     /// Port to connect to
-    #[arg(short, long, default_value = "4433")]
+    #[arg(short, long, default_value = "8443")]
     port: u16,
 }
 
@@ -32,11 +39,9 @@ async fn main() -> anyhow::Result<()> {
         .with_custom_certificate_verifier(Arc::new(SkipVerification))
         .with_no_client_auth();
 
-    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
-    let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
-    ));
+    let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
     // Convert 0.0.0.0 to 127.0.0.1 since 0.0.0.0 is not a valid destination
     let host = if args.host == "0.0.0.0" {
@@ -45,47 +50,40 @@ async fn main() -> anyhow::Result<()> {
         args.host
     };
 
-    let addr: SocketAddr = format!("{}:{}", host, args.port).parse()?;
-
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
-
     let start_time = Instant::now();
 
-    let conn = endpoint.connect(addr, &host)?.await?;
-    println!("QUIC connection established ({}ms)", start_time.elapsed().as_millis());
+    let addr: SocketAddr = format!("{}:{}", host, args.port).parse()?;
+    let stream = TcpStream::connect(addr).await?;
 
-    let quinn_conn = h3_quinn::Connection::new(conn);
-    let (mut driver, mut send_request) = h3::client::new(quinn_conn).await?;
+    let server_name = ServerName::try_from(host.clone())?.to_owned();
+    let tls_stream = tls_connector.connect(server_name, stream).await?;
+    println!("TLS connection established ({}ms)", start_time.elapsed().as_millis());
 
-    let drive = tokio::spawn(async move {
-        futures::future::poll_fn(|cx| driver.poll_close(cx)).await
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)).await?;
+    println!("HTTP/2 connection established ({}ms)", start_time.elapsed().as_millis());
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("Connection error: {}", e);
+        }
     });
 
     let uri = format!("https://{}:{}/", host, args.port);
-    let req = http::Request::builder()
+    let req = Request::builder()
         .uri(&uri)
         .method("GET")
-        .body(())?;
+        .body(Empty::<Bytes>::new())?;
 
-    let mut stream = send_request.send_request(req).await?;
-    stream.finish().await?;
-
-    let resp = stream.recv_response().await?;
+    let resp = sender.send_request(req).await?;
     println!("Response: {:?} {}", resp.version(), resp.status());
 
-    while let Some(mut chunk) = stream.recv_data().await? {
-        let mut stdout = tokio::io::stdout();
-        stdout.write_all_buf(&mut chunk).await?;
-        stdout.flush().await?;
-    }
+    let body = resp.into_body().collect().await?.to_bytes();
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(&body).await?;
+    stdout.flush().await?;
 
     let total_latency = start_time.elapsed();
     println!("\nTotal latency: {:.2}ms", total_latency.as_secs_f64() * 1000.0);
-
-    drop(send_request);
-    drive.await?;  // fixed: only one ?, ConnectionError doesn't impl Try
-    endpoint.wait_idle().await;
 
     Ok(())
 }
@@ -105,11 +103,21 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerification {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
-    fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 

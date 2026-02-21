@@ -2,11 +2,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use clap::Parser;
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
+#[derive(Parser, Debug)]
+#[command(name = "h3-server", about = "HTTP/3 server")]
+struct Args {
+    /// Port to listen on
+    #[arg(short, long, default_value = "4433")]
+    port: u16,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
@@ -28,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         h3_quinn::quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?,
     ));
 
-    let addr: SocketAddr = "0.0.0.0:4433".parse()?;
+    let addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse()?;
     let endpoint = Endpoint::server(server_config, addr)?;
     println!("Listening on {}", addr);
 
