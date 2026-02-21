@@ -14,8 +14,15 @@ http = "1.4.0"
 http-body-util = "0.1"
 hyper = { version = "1.6", features = ["http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+prost = "0.13"
 quinn = "0.11.9"
 rcgen = "0.14.7"
 rustls = { version = "0.23.36", features = ["ring"] }
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-rustls = "0.26"
+tonic = { version = "0.12", features = ["tls"] }
+hyper-rustls = { version = "0.27", features = ["http2"] }
+tower = "0.4"
+
+[build-dependencies]
+tonic-build = "0.12"
