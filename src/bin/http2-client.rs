@@ -5,17 +5,37 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use clap::Parser;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Frame;
 use hyper::client::conn::http2;
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
+use tokio_stream::StreamExt;
+
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, anyhow::Error>;
+
+fn full_body(data: Bytes) -> BoxBody {
+    Full::new(data).map_err(|e| anyhow::anyhow!(e)).boxed()
+}
+
+fn stream_body(rx: mpsc::Receiver<Bytes>) -> BoxBody {
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let stream = stream.map(|b| Ok::<_, anyhow::Error>(Frame::data(b)));
+    StreamBody::new(stream).boxed()
+}
+
+const SMALL_SIZE: usize = 20;
+const LARGE_SIZE: usize = 1_048_576; // 1 MB
+const STREAM_CHUNKS: usize = 100;
+const STREAM_CHUNK_SIZE: usize = 10_240; // 10 KB
+const MANY_COUNT: usize = 1000;
 
 #[derive(Parser, Debug)]
-#[command(name = "http2-client", about = "HTTP/2 client")]
+#[command(name = "http2-client", about = "HTTP/2 benchmark client")]
 struct Args {
     /// Host to connect to
     #[arg(short = 'H', long, default_value = "127.0.0.1")]
@@ -38,29 +58,24 @@ async fn main() -> anyhow::Result<()> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerification))
         .with_no_client_auth();
-
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
-    // Convert 0.0.0.0 to 127.0.0.1 since 0.0.0.0 is not a valid destination
     let host = if args.host == "0.0.0.0" {
         "127.0.0.1".to_string()
     } else {
         args.host
     };
 
-    let start_time = Instant::now();
-
     let addr: SocketAddr = format!("{}:{}", host, args.port).parse()?;
     let stream = TcpStream::connect(addr).await?;
 
     let server_name = ServerName::try_from(host.clone())?.to_owned();
     let tls_stream = tls_connector.connect(server_name, stream).await?;
-    println!("TLS connection established ({}ms)", start_time.elapsed().as_millis());
 
-    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)).await?;
-    println!("HTTP/2 connection established ({}ms)", start_time.elapsed().as_millis());
+    let (sender, conn) =
+        http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream)).await?;
 
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -68,23 +83,233 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let uri = format!("https://{}:{}/", host, args.port);
-    let req = Request::builder()
-        .uri(&uri)
-        .method("GET")
-        .body(Empty::<Bytes>::new())?;
+    let base_uri = format!("https://{}:{}", host, args.port);
 
-    let resp = sender.send_request(req).await?;
-    println!("Response: {:?} {}", resp.version(), resp.status());
+    println!("=== HTTP/2 Benchmark ===\n");
 
+    // 1. Small payload
+    test_small_payload(&sender, &base_uri).await?;
+
+    // 2. Large payload
+    test_large_payload(&sender, &base_uri).await?;
+
+    // 3. Server streaming
+    test_server_stream(&sender, &base_uri).await?;
+
+    // 4. Client streaming
+    test_client_stream(&sender, &base_uri).await?;
+
+    // 5. Bidirectional streaming
+    test_bidi_stream(&sender, &base_uri).await?;
+
+    // 6. Many small requests
+    test_many_requests(&sender, &base_uri).await?;
+
+    Ok(())
+}
+
+async fn test_small_payload(
+    sender: &http2::SendRequest<BoxBody>,
+    base_uri: &str,
+) -> anyhow::Result<()> {
+    let data = Bytes::from(vec![0x42u8; SMALL_SIZE]);
+    let start = Instant::now();
+
+    let req = Request::post(format!("{}/small", base_uri))
+        .body(full_body(data))?;
+
+    let resp = sender.clone().send_request(req).await?;
     let body = resp.into_body().collect().await?.to_bytes();
-    let mut stdout = tokio::io::stdout();
-    stdout.write_all(&body).await?;
-    stdout.flush().await?;
 
-    let total_latency = start_time.elapsed();
-    println!("\nTotal latency: {:.2}ms", total_latency.as_secs_f64() * 1000.0);
+    let elapsed = start.elapsed();
+    println!(
+        "Small payload ({} B):    {:.2}ms  (sent {} B, recv {} B)",
+        SMALL_SIZE,
+        elapsed.as_secs_f64() * 1000.0,
+        SMALL_SIZE,
+        body.len(),
+    );
+    Ok(())
+}
 
+async fn test_large_payload(
+    sender: &http2::SendRequest<BoxBody>,
+    base_uri: &str,
+) -> anyhow::Result<()> {
+    let data = Bytes::from(vec![0x42u8; LARGE_SIZE]);
+    let start = Instant::now();
+
+    let req = Request::post(format!("{}/large", base_uri))
+        .body(full_body(data))?;
+
+    let resp = sender.clone().send_request(req).await?;
+    let body = resp.into_body().collect().await?.to_bytes();
+
+    let elapsed = start.elapsed();
+    let total_bytes = (LARGE_SIZE + body.len()) as f64;
+    let throughput = total_bytes / elapsed.as_secs_f64() / 1_048_576.0;
+    println!(
+        "Large payload ({:.0} KB):  {:.2}ms  ({:.1} MB/s)",
+        LARGE_SIZE as f64 / 1024.0,
+        elapsed.as_secs_f64() * 1000.0,
+        throughput,
+    );
+    Ok(())
+}
+
+async fn test_server_stream(
+    sender: &http2::SendRequest<BoxBody>,
+    base_uri: &str,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+
+    let params = format!("{}:{}", STREAM_CHUNKS, STREAM_CHUNK_SIZE);
+    let req = Request::post(format!("{}/server-stream", base_uri))
+        .body(full_body(Bytes::from(params)))?;
+
+    let resp = sender.clone().send_request(req).await?;
+    let mut body = resp.into_body();
+
+    let mut total_bytes: usize = 0;
+    let mut count: usize = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            total_bytes += data.len();
+            count += 1;
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let throughput = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    println!(
+        "Server stream ({} x {} KB): {:.2}ms  ({:.1} MB/s, {} chunks, {} B total)",
+        STREAM_CHUNKS,
+        STREAM_CHUNK_SIZE / 1024,
+        elapsed.as_secs_f64() * 1000.0,
+        throughput,
+        count,
+        total_bytes,
+    );
+    Ok(())
+}
+
+async fn test_client_stream(
+    sender: &http2::SendRequest<BoxBody>,
+    base_uri: &str,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+
+    let (tx, rx) = mpsc::channel::<Bytes>(32);
+
+    let req = Request::post(format!("{}/client-stream", base_uri))
+        .body(stream_body(rx))?;
+
+    let resp_fut = sender.clone().send_request(req);
+
+    // Send chunks
+    let send_handle = tokio::spawn(async move {
+        let chunk = Bytes::from(vec![0x42u8; STREAM_CHUNK_SIZE]);
+        for _ in 0..STREAM_CHUNKS {
+            if tx.send(chunk.clone()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let resp = resp_fut.await?;
+    send_handle.await?;
+    let body = resp.into_body().collect().await?.to_bytes();
+
+    let elapsed = start.elapsed();
+    let total_bytes = STREAM_CHUNKS * STREAM_CHUNK_SIZE;
+    let throughput = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
+    println!(
+        "Client stream ({} x {} KB): {:.2}ms  ({:.1} MB/s, server resp: {})",
+        STREAM_CHUNKS,
+        STREAM_CHUNK_SIZE / 1024,
+        elapsed.as_secs_f64() * 1000.0,
+        throughput,
+        String::from_utf8_lossy(&body),
+    );
+    Ok(())
+}
+
+async fn test_bidi_stream(
+    sender: &http2::SendRequest<BoxBody>,
+    base_uri: &str,
+) -> anyhow::Result<()> {
+    let bidi_chunks = 50;
+    let start = Instant::now();
+
+    let (tx, rx) = mpsc::channel::<Bytes>(32);
+
+    let req = Request::post(format!("{}/bidi", base_uri))
+        .body(stream_body(rx))?;
+
+    let resp_fut = sender.clone().send_request(req);
+
+    // Sender task
+    let send_handle = tokio::spawn(async move {
+        let chunk = Bytes::from(vec![0x42u8; STREAM_CHUNK_SIZE]);
+        for _ in 0..bidi_chunks {
+            if tx.send(chunk.clone()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let resp = resp_fut.await?;
+    let mut body = resp.into_body();
+
+    let mut recv_count: usize = 0;
+    let mut recv_bytes: usize = 0;
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            recv_bytes += data.len();
+            recv_count += 1;
+        }
+    }
+
+    send_handle.await?;
+
+    let elapsed = start.elapsed();
+    let total_bytes = (bidi_chunks * STREAM_CHUNK_SIZE + recv_bytes) as f64;
+    let throughput = total_bytes / elapsed.as_secs_f64() / 1_048_576.0;
+    println!(
+        "Bidi stream ({} each way): {:.2}ms  ({:.1} MB/s, sent {}, recv {} chunks)",
+        bidi_chunks,
+        elapsed.as_secs_f64() * 1000.0,
+        throughput,
+        bidi_chunks,
+        recv_count,
+    );
+    Ok(())
+}
+
+async fn test_many_requests(
+    sender: &http2::SendRequest<BoxBody>,
+    base_uri: &str,
+) -> anyhow::Result<()> {
+    let data = Bytes::from(vec![0x42u8; SMALL_SIZE]);
+    let start = Instant::now();
+
+    for _ in 0..MANY_COUNT {
+        let req = Request::post(format!("{}/small", base_uri))
+            .body(full_body(data.clone()))?;
+        let resp = sender.clone().send_request(req).await?;
+        resp.into_body().collect().await?;
+    }
+
+    let elapsed = start.elapsed();
+    let rps = MANY_COUNT as f64 / elapsed.as_secs_f64();
+    println!(
+        "Many requests ({} reqs):  {:.2}ms  ({:.0} req/s)",
+        MANY_COUNT,
+        elapsed.as_secs_f64() * 1000.0,
+        rps,
+    );
     Ok(())
 }
 

@@ -1,18 +1,21 @@
 // src/bin/grpc-server.rs
 use std::net::SocketAddr;
+use std::pin::Pin;
 
 use clap::Parser;
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tonic::{transport::Server, Request, Response, Status, Streaming};
 
-pub mod hello {
+pub mod bench {
     tonic::include_proto!("hello");
 }
 
-use hello::greeter_server::{Greeter, GreeterServer};
-use hello::{HelloRequest, HelloResponse};
+use bench::bench_server::{Bench, BenchServer};
+use bench::{Payload, StreamRequest, StreamResponse};
 
 #[derive(Parser, Debug)]
-#[command(name = "grpc-server", about = "gRPC server")]
+#[command(name = "grpc-server", about = "gRPC benchmark server")]
 struct Args {
     /// Port to listen on
     #[arg(short, long, default_value = "50051")]
@@ -20,21 +23,100 @@ struct Args {
 }
 
 #[derive(Debug, Default)]
-pub struct MyGreeter {}
+pub struct BenchService {}
 
 #[tonic::async_trait]
-impl Greeter for MyGreeter {
-    async fn say_hello(
+impl Bench for BenchService {
+    async fn small_payload(
         &self,
-        request: Request<HelloRequest>,
-    ) -> Result<Response<HelloResponse>, Status> {
-        println!("Got request from {:?}", request.remote_addr());
+        request: Request<Payload>,
+    ) -> Result<Response<Payload>, Status> {
+        Ok(Response::new(Payload {
+            data: request.into_inner().data,
+        }))
+    }
 
-        let reply = HelloResponse {
-            message: format!("Hello from gRPC, {}!", request.into_inner().name),
-        };
+    async fn large_payload(
+        &self,
+        request: Request<Payload>,
+    ) -> Result<Response<Payload>, Status> {
+        // Echo back same-sized payload
+        let size = request.into_inner().data.len();
+        let data = vec![0xABu8; size];
+        Ok(Response::new(Payload { data }))
+    }
 
-        Ok(Response::new(reply))
+    type ServerStreamStream =
+        Pin<Box<dyn Stream<Item = Result<Payload, Status>> + Send + 'static>>;
+
+    async fn server_stream(
+        &self,
+        request: Request<StreamRequest>,
+    ) -> Result<Response<Self::ServerStreamStream>, Status> {
+        let req = request.into_inner();
+        let chunks = req.chunks as usize;
+        let chunk_size = req.chunk_size as usize;
+
+        let (tx, rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            let chunk_data = vec![0xABu8; chunk_size];
+            for _ in 0..chunks {
+                if tx
+                    .send(Ok(Payload {
+                        data: chunk_data.clone(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn client_stream(
+        &self,
+        request: Request<Streaming<Payload>>,
+    ) -> Result<Response<StreamResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut total_bytes: i64 = 0;
+        let mut total_chunks: i32 = 0;
+
+        while let Some(payload) = stream.next().await {
+            let payload = payload?;
+            total_bytes += payload.data.len() as i64;
+            total_chunks += 1;
+        }
+
+        Ok(Response::new(StreamResponse {
+            total_bytes,
+            total_chunks,
+        }))
+    }
+
+    type BidiStreamStream =
+        Pin<Box<dyn Stream<Item = Result<Payload, Status>> + Send + 'static>>;
+
+    async fn bidi_stream(
+        &self,
+        request: Request<Streaming<Payload>>,
+    ) -> Result<Response<Self::BidiStreamStream>, Status> {
+        let mut stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            while let Some(Ok(payload)) = stream.next().await {
+                // Echo each message back
+                if tx.send(Ok(payload)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
@@ -50,7 +132,6 @@ async fn main() -> anyhow::Result<()> {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
 
-    // Convert to PEM format for tonic
     let cert_pem = cert.pem();
     let key_pem = signing_key.serialize_pem();
 
@@ -58,13 +139,13 @@ async fn main() -> anyhow::Result<()> {
         .identity(tonic::transport::Identity::from_pem(&cert_pem, &key_pem));
 
     let addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse()?;
-    let greeter = MyGreeter::default();
+    let service = BenchService::default();
 
-    println!("Listening on {}", addr);
+    println!("gRPC benchmark server listening on {}", addr);
 
     Server::builder()
         .tls_config(tls_config)?
-        .add_service(GreeterServer::new(greeter))
+        .add_service(BenchServer::new(service))
         .serve(addr)
         .await?;
 

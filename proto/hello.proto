@@ -2,14 +2,27 @@ syntax = "proto3";
 
 package hello;
 
-service Greeter {
-    rpc SayHello (HelloRequest) returns (HelloResponse);
+service Bench {
+    // Unary RPCs
+    rpc SmallPayload (Payload) returns (Payload);
+    rpc LargePayload (Payload) returns (Payload);
+
+    // Streaming RPCs
+    rpc ServerStream (StreamRequest) returns (stream Payload);
+    rpc ClientStream (stream Payload) returns (StreamResponse);
+    rpc BidiStream (stream Payload) returns (stream Payload);
 }
 
-message HelloRequest {
-    string name = 1;
+message Payload {
+    bytes data = 1;
 }
 
-message HelloResponse {
-    string message = 1;
+message StreamRequest {
+    int32 chunks = 1;
+    int32 chunk_size = 2;
+}
+
+message StreamResponse {
+    int64 total_bytes = 1;
+    int32 total_chunks = 2;
 }

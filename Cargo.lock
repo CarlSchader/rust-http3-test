@@ -1390,6 +1390,7 @@ dependencies = [
  "rustls",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tower 0.4.13",
